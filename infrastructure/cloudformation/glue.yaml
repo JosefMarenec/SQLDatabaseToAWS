@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time E-Commerce Analytics Platform - Glue Stack
+  Provisions S3 data lake buckets (raw/processed/curated), Glue data catalog,
+  crawlers for schema discovery, and ETL job definitions.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ecom-analytics
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  GlueVersion:
+    Type: String
+    Default: '4.0'
+    Description: AWS Glue version for Spark jobs
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 5
+    Description: Number of G.1X workers for ETL jobs
+
+  # RDS connection details (imported from rds.yaml)
+  RDSStackName:
+    Type: String
+    Default: ecom-analytics-prod-rds
+
+Resources:
+
+  # ═══════════════════════════════════════════
+  # S3 DATA LAKE BUCKETS
+  # ═══════════════════════════════════════════
+
+  # Raw zone — unprocessed data as exported from source
+  DataLakeRawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-data-lake-raw'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: DataZone
+          Value: raw
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # Processed zone — validated, cleaned Parquet files
+  DataLakeProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-data-lake-processed'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 60
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 180
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: DataZone
+          Value: processed
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # Curated zone — business-ready aggregations, ready for BI tools
+  DataLakeCuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-data-lake-curated'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: DataZone
+          Value: curated
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # Quarantine zone — invalid/malformed files
+  DataLakeQuarantineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-data-lake-quarantine'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQuarantined
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Scripts bucket for Glue PySpark jobs
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-glue-scripts'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Temp bucket for Glue shuffle/spill
+  GlueTempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-glue-temp'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTempFiles
+            Status: Enabled
+            ExpirationInDays: 3
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ═══════════════════════════════════════════
+  # IAM ROLE FOR GLUE
+  # ═══════════════════════════════════════════
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-glue-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueDataLakeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3DataLakeFullAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt DataLakeRawBucket.Arn
+                  - !Sub '${DataLakeRawBucket.Arn}/*'
+                  - !GetAtt DataLakeProcessedBucket.Arn
+                  - !Sub '${DataLakeProcessedBucket.Arn}/*'
+                  - !GetAtt DataLakeCuratedBucket.Arn
+                  - !Sub '${DataLakeCuratedBucket.Arn}/*'
+                  - !GetAtt DataLakeQuarantineBucket.Arn
+                  - !Sub '${DataLakeQuarantineBucket.Arn}/*'
+                  - !GetAtt GlueScriptsBucket.Arn
+                  - !Sub '${GlueScriptsBucket.Arn}/*'
+                  - !GetAtt GlueTempBucket.Arn
+                  - !Sub '${GlueTempBucket.Arn}/*'
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}-${Environment}-*'
+              - Sid: DynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectPrefix}-${Environment}-*'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectPrefix}-${Environment}-*'
+
+  # ═══════════════════════════════════════════
+  # GLUE DATA CATALOG
+  # ═══════════════════════════════════════════
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectPrefix}_${Environment}'
+        Description: !Sub 'Glue catalog for ${ProjectPrefix} ${Environment} data lake'
+        LocationUri: !Sub 's3://${DataLakeProcessedBucket}/'
+        Parameters:
+          classification: parquet
+
+  GlueDatabaseRaw:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectPrefix}_${Environment}_raw'
+        Description: !Sub 'Raw zone catalog for ${ProjectPrefix} ${Environment}'
+        LocationUri: !Sub 's3://${DataLakeRawBucket}/'
+
+  # ── RDS Connection ─────────────────────────
+  GlueRDSConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub '${ProjectPrefix}-${Environment}-rds-connection'
+        Description: JDBC connection to RDS PostgreSQL
+        ConnectionType: JDBC
+        PhysicalConnectionRequirements:
+          SubnetId:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-1'
+          SecurityGroupIdList:
+            - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-app-sg-id'
+          AvailabilityZone: !Select [0, !GetAZs '']
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Sub
+            - 'jdbc:postgresql://${Endpoint}:5432/ecommerce'
+            - Endpoint:
+                Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-rds-endpoint'
+          JDBC_ENFORCE_SSL: 'true'
+          SECRET_ID: !Sub '${ProjectPrefix}-${Environment}-rds-credentials'
+
+  # ═══════════════════════════════════════════
+  # GLUE CRAWLERS
+  # ═══════════════════════════════════════════
+
+  # Crawl RDS tables to discover schema
+  GlueRDSCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-crawler'
+      Description: Crawls RDS PostgreSQL to discover table schemas
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        JdbcTargets:
+          - ConnectionName: !Ref GlueRDSConnection
+            Path: 'ecommerce/public/%'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_CHANGED_SCHEMAS_ONLY
+      Schedule:
+        ScheduleExpression: 'cron(0 1 * * ? *)'   # Daily at 1am UTC
+      Tags:
+        Project: !Ref ProjectPrefix
+
+  # Crawl processed S3 zone
+  GlueS3ProcessedCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-s3-processed-crawler'
+      Description: Crawls processed S3 zone to maintain catalog partitions
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataLakeProcessedBucket}/orders/'
+            Exclusions: ['_temporary/**', '*.crc']
+          - Path: !Sub 's3://${DataLakeProcessedBucket}/events/'
+            Exclusions: ['_temporary/**', '*.crc']
+          - Path: !Sub 's3://${DataLakeProcessedBucket}/customers/'
+            Exclusions: ['_temporary/**', '*.crc']
+          - Path: !Sub 's3://${DataLakeProcessedBucket}/products/'
+            Exclusions: ['_temporary/**', '*.crc']
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          },
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
+            "Tables": { "AddOrUpdateBehavior": "MergeNewColumns" }
+          }
+        }
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Schedule:
+        ScheduleExpression: 'cron(30 * * * ? *)'  # Every hour at :30
+      Tags:
+        Project: !Ref ProjectPrefix
+
+  # Crawl raw S3 zone (events from Kinesis)
+  GlueS3RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-s3-raw-crawler'
+      Description: Crawls raw S3 zone for clickstream events
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabaseRaw
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataLakeRawBucket}/events/'
+            Exclusions: ['_temporary/**']
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Schedule:
+        ScheduleExpression: 'cron(0 * * * ? *)'  # Every hour on the hour
+      Tags:
+        Project: !Ref ProjectPrefix
+
+  # ═══════════════════════════════════════════
+  # GLUE ETL JOBS
+  # ═══════════════════════════════════════════
+
+  # Job 1: RDS to S3 incremental extract
+  GlueJobRDSToS3:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-to-s3'
+      Description: >
+        Incremental extract from RDS PostgreSQL to S3 processed zone.
+        Uses job bookmarks for watermark tracking. Outputs Parquet partitioned by date.
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: 120
+      MaxRetries: 1
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptsBucket}/jobs/rds_to_s3.py'
+      DefaultArguments:
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${GlueTempBucket}/spark-logs/'
+        '--TempDir': !Sub 's3://${GlueTempBucket}/temp/'
+        '--extra-py-files': !Sub 's3://${GlueScriptsBucket}/lib/utils.py'
+        '--rds_secret_name': !Sub '${ProjectPrefix}-${Environment}-rds-credentials'
+        '--s3_output_bucket': !Ref DataLakeProcessedBucket
+        '--environment': !Ref Environment
+        '--project_prefix': !Ref ProjectPrefix
+      Connections:
+        Connections:
+          - !Ref GlueRDSConnection
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Project: !Ref ProjectPrefix
+        JobType: extract
+
+  # Job 2: S3 to Redshift load with SCD Type 2
+  GlueJobS3ToRedshift:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-s3-to-redshift'
+      Description: >
+        Loads validated Parquet data from S3 processed zone into Redshift warehouse.
+        Applies SCD Type 2 for dimension tables and upsert logic for fact tables.
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: 180
+      MaxRetries: 1
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptsBucket}/jobs/s3_to_redshift.py'
+      DefaultArguments:
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--TempDir': !Sub 's3://${GlueTempBucket}/temp/'
+        '--redshift_secret_name': !Sub '${ProjectPrefix}-${Environment}-redshift-credentials'
+        '--s3_input_bucket': !Ref DataLakeProcessedBucket
+        '--s3_temp_bucket': !Ref GlueTempBucket
+        '--environment': !Ref Environment
+        '--project_prefix': !Ref ProjectPrefix
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Project: !Ref ProjectPrefix
+        JobType: load
+
+  # Job 3: Data quality validation
+  GlueJobDataQuality:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-data-quality'
+      Description: >
+        Validates data quality of files in S3 processed zone.
+        Checks schema, nulls, ranges, referential integrity, duplicates.
+        Writes quality report to DynamoDB and S3.
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: G.1X
+      NumberOfWorkers: 3
+      Timeout: 60
+      MaxRetries: 0  # Do not retry quality checks — fail fast
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptsBucket}/jobs/data_quality.py'
+      DefaultArguments:
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--TempDir': !Sub 's3://${GlueTempBucket}/temp/'
+        '--s3_processed_bucket': !Ref DataLakeProcessedBucket
+        '--s3_quarantine_bucket': !Ref DataLakeQuarantineBucket
+        '--dynamodb_table': !Sub '${ProjectPrefix}-${Environment}-quality-reports'
+        '--environment': !Ref Environment
+        '--project_prefix': !Ref ProjectPrefix
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Project: !Ref ProjectPrefix
+        JobType: quality
+
+  # ═══════════════════════════════════════════
+  # GLUE WORKFLOWS & TRIGGERS
+  # ═══════════════════════════════════════════
+
+  # Main ETL workflow: extract → quality → load
+  GlueETLWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-etl-workflow'
+      Description: Orchestrates the full ETL pipeline from RDS to Redshift
+
+  # Trigger 1: Start extract job on schedule
+  GlueTriggerExtract:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-trigger-extract'
+      WorkflowName: !Ref GlueETLWorkflow
+      Type: SCHEDULED
+      Schedule: 'cron(0 * * * ? *)'  # Every hour
+      StartOnCreation: false
+      Actions:
+        - JobName: !Ref GlueJobRDSToS3
+          Arguments:
+            '--job-bookmark-option': 'job-bookmark-enable'
+
+  # Trigger 2: Start quality check after extract succeeds
+  GlueTriggerQuality:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-trigger-quality'
+      WorkflowName: !Ref GlueETLWorkflow
+      Type: CONDITIONAL
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - JobName: !Ref GlueJobRDSToS3
+            State: SUCCEEDED
+            LogicalOperator: EQUALS
+      Actions:
+        - JobName: !Ref GlueJobDataQuality
+
+  # Trigger 3: Start load after quality check succeeds
+  GlueTriggerLoad:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-trigger-load'
+      WorkflowName: !Ref GlueETLWorkflow
+      Type: CONDITIONAL
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - JobName: !Ref GlueJobDataQuality
+            State: SUCCEEDED
+            LogicalOperator: EQUALS
+      Actions:
+        - JobName: !Ref GlueJobS3ToRedshift
+
+  # ═══════════════════════════════════════════
+  # DYNAMODB TABLE FOR QUALITY REPORTS
+  # ═══════════════════════════════════════════
+  QualityReportTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectPrefix}-${Environment}-quality-reports'
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: report_id
+          AttributeType: S
+        - AttributeName: run_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: report_id
+          KeyType: HASH
+        - AttributeName: run_date
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: run_date-index
+          KeySchema:
+            - AttributeName: run_date
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+Outputs:
+  RawBucketName:
+    Value: !Ref DataLakeRawBucket
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-raw-bucket'
+
+  ProcessedBucketName:
+    Value: !Ref DataLakeProcessedBucket
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-processed-bucket'
+
+  CuratedBucketName:
+    Value: !Ref DataLakeCuratedBucket
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-curated-bucket'
+
+  QuarantineBucketName:
+    Value: !Ref DataLakeQuarantineBucket
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-quarantine-bucket'
+
+  GlueScriptsBucketName:
+    Value: !Ref GlueScriptsBucket
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-glue-scripts-bucket'
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-glue-database'
+
+  GlueServiceRoleArn:
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-glue-role-arn'
+
+  QualityReportTableName:
+    Value: !Ref QualityReportTable
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-quality-table'

@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time E-Commerce Analytics Platform - Redshift Stack
+  Provisions Redshift cluster (dc2.large, 2 nodes) with IAM roles for S3/Glue access,
+  parameter group, subnet group, and security group. Imports VPC resources from rds.yaml stack.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ecom-analytics
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  NodeType:
+    Type: String
+    Default: dc2.large
+    AllowedValues:
+      - dc2.large
+      - dc2.8xlarge
+      - ra3.xlplus
+      - ra3.4xlarge
+      - ra3.16xlarge
+
+  NumberOfNodes:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 32
+
+  DBName:
+    Type: String
+    Default: analytics
+
+  MasterUsername:
+    Type: String
+    Default: rsadmin
+
+  # Imported from rds.yaml stack
+  RDSStackName:
+    Type: String
+    Default: ecom-analytics-prod-rds
+    Description: Name of the RDS CloudFormation stack to import VPC/subnet values from
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+  IsMultiNode: !Not [!Equals [!Ref NumberOfNodes, '1']]
+
+Resources:
+
+  # ── Secrets Manager for Redshift ──────────
+  RedshiftMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-credentials'
+      Description: !Sub 'Master credentials for ${ProjectPrefix} Redshift cluster'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\ \'
+        ExcludePunctuation: false
+        IncludeSpace: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Security Group ─────────────────────────
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Redshift cluster — restricts access to app tier
+      VpcId:
+        Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-vpc-id'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-app-sg-id'
+          Description: Redshift from application tier
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-redshift-sg'
+
+  # ── Subnet Group ───────────────────────────
+  RedshiftSubnetGroup:
+    Type: AWS::Redshift::ClusterSubnetGroup
+    Properties:
+      Description: !Sub 'Private subnets for ${ProjectPrefix} Redshift cluster'
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-1'
+        - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-2'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-redshift-subnet-group'
+
+  # ── Parameter Group ────────────────────────
+  RedshiftParameterGroup:
+    Type: AWS::Redshift::ClusterParameterGroup
+    Properties:
+      Description: !Sub '${ProjectPrefix} Redshift parameter group — analytics tuned'
+      ParameterGroupFamily: redshift-1.0
+      Parameters:
+        # Enable result caching for repeated queries
+        - ParameterName: enable_result_cache_for_session
+          ParameterValue: 'true'
+        # WLM — Short Query Acceleration
+        - ParameterName: wlm_json_configuration
+          ParameterValue: |
+            [
+              {
+                "name": "short_query_queue",
+                "auto_wlm": true,
+                "short_query_queue": true
+              },
+              {
+                "name": "etl_queue",
+                "query_group": ["etl"],
+                "query_group_wild_card": 0,
+                "user_group": ["etl_user"],
+                "user_group_wild_card": 0,
+                "concurrency_scaling": "auto",
+                "memory_percent_to_use": 50
+              },
+              {
+                "name": "default_queue",
+                "concurrency_scaling": "auto",
+                "auto_wlm": true
+              }
+            ]
+        # Spectrum concurrency scaling
+        - ParameterName: spectrum_enable_enhanced_vpc_routing
+          ParameterValue: 'false'
+        # Enable user activity logging
+        - ParameterName: enable_user_activity_logging
+          ParameterValue: 'true'
+        # Time zone
+        - ParameterName: timezone
+          ParameterValue: UTC
+        # Date format
+        - ParameterName: datestyle
+          ParameterValue: ISO, MDY
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-redshift-params'
+
+  # ── IAM Role for S3 and Glue access ───────
+  RedshiftS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-redshift-s3-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RedshiftS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read access to data lake buckets
+              - Sid: S3DataLakeRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${Environment}-data-lake-*'
+                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${Environment}-data-lake-*/*'
+              # Write access for UNLOAD operations
+              - Sid: S3UnloadWrite
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectPrefix}-${Environment}-data-lake-curated/*'
+              # Glue Catalog access for Spectrum
+              - Sid: GlueCatalogRead
+                Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:GetPartition
+                  - glue:BatchGetPartition
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # ── Redshift Cluster ───────────────────────
+  RedshiftCluster:
+    Type: AWS::Redshift::Cluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      ClusterIdentifier: !Sub '${ProjectPrefix}-${Environment}-cluster'
+      DBName: !Ref DBName
+      NodeType: !Ref NodeType
+      ClusterType: !If [IsMultiNode, multi-node, single-node]
+      NumberOfNodes: !If [IsMultiNode, !Ref NumberOfNodes, !Ref AWS::NoValue]
+      MasterUsername: !Sub '{{resolve:secretsmanager:${RedshiftMasterSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RedshiftMasterSecret}:SecretString:password}}'
+      ClusterSubnetGroupName: !Ref RedshiftSubnetGroup
+      ClusterParameterGroupName: !Ref RedshiftParameterGroup
+      VpcSecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      IamRoles:
+        - !GetAtt RedshiftS3Role.Arn
+      Encrypted: true
+      # Automatic snapshots
+      AutomatedSnapshotRetentionPeriod: !If [IsProd, 7, 1]
+      PreferredMaintenanceWindow: 'sun:05:00-sun:06:00'
+      # Logging to S3
+      LoggingProperties:
+        BucketName: !Sub '${ProjectPrefix}-${Environment}-redshift-logs'
+        S3KeyPrefix: !Sub '${Environment}/audit/'
+      # Enhanced VPC routing forces Redshift traffic through VPC
+      EnhancedVpcRouting: true
+      PubliclyAccessible: false
+      AllowVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-redshift'
+        - Key: Project
+          Value: !Ref ProjectPrefix
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── S3 Bucket for Redshift Audit Logs ─────
+  RedshiftLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectPrefix}-${Environment}-redshift-logs'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  RedshiftLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RedshiftLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRedshiftLogging
+            Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${RedshiftLogsBucket.Arn}/*'
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RedshiftLogsBucket.Arn
+              - !Sub '${RedshiftLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ── CloudWatch Alarms ──────────────────────
+  RedshiftDiskAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-redshift-disk-high'
+      AlarmDescription: Redshift disk usage exceeds 85%
+      Namespace: AWS/Redshift
+      MetricName: PercentageDiskSpaceUsed
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RedshiftCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-redshift-cpu-high'
+      AlarmDescription: Redshift CPU exceeds 90% for 10 minutes
+      Namespace: AWS/Redshift
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  RedshiftClusterEndpoint:
+    Description: Redshift cluster endpoint address
+    Value: !GetAtt RedshiftCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-endpoint'
+
+  RedshiftClusterPort:
+    Description: Redshift cluster port
+    Value: !GetAtt RedshiftCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-port'
+
+  RedshiftDBName:
+    Description: Redshift database name
+    Value: !Ref DBName
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-dbname'
+
+  RedshiftSecretArn:
+    Description: ARN of Secrets Manager secret for Redshift credentials
+    Value: !Ref RedshiftMasterSecret
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-secret-arn'
+
+  RedshiftS3RoleArn:
+    Description: IAM role ARN for Redshift S3/Glue access
+    Value: !GetAtt RedshiftS3Role.Arn
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-role-arn'
+
+  RedshiftClusterIdentifier:
+    Description: Redshift cluster identifier
+    Value: !Ref RedshiftCluster
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-redshift-cluster-id'

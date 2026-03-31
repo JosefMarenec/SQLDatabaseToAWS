@@ -1,0 +1,544 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time E-Commerce Analytics Platform - Lambda Stack
+  Provisions Lambda functions (event processor, data validator, partition manager),
+  SQS queues, EventBridge rules, SNS topics, and least-privilege IAM roles.
+
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ecom-analytics
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  RDSStackName:
+    Type: String
+    Default: ecom-analytics-prod-rds
+
+  GlueStackName:
+    Type: String
+    Default: ecom-analytics-prod-glue
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.11
+
+  EventProcessorBatchSize:
+    Type: Number
+    Default: 100
+    Description: Number of SQS messages per Lambda invocation
+
+  EventProcessorTimeout:
+    Type: Number
+    Default: 60
+    Description: Lambda timeout in seconds
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+
+  # ═══════════════════════════════════════════
+  # SQS QUEUES
+  # ═══════════════════════════════════════════
+
+  # Dead-letter queue for failed event processing
+  EventProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectPrefix}-${Environment}-event-processor-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # Main event queue — receives clickstream events from Kinesis Firehose or direct producers
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectPrefix}-${Environment}-event-queue'
+      VisibilityTimeout: 300         # 5× Lambda timeout
+      MessageRetentionPeriod: 86400  # 1 day
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventProcessorDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # ═══════════════════════════════════════════
+  # SNS TOPICS
+  # ═══════════════════════════════════════════
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectPrefix}-${Environment}-alerts'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+
+  # ═══════════════════════════════════════════
+  # IAM ROLES
+  # ═══════════════════════════════════════════
+
+  # Role for event processor Lambda
+  EventProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-event-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      Policies:
+        - PolicyName: EventProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}-${Environment}-rds-credentials*'
+              - Sid: SQSSendDLQ
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt EventProcessorDLQ.Arn
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+
+  # Role for data validator Lambda
+  DataValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-data-validator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataValidatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ReadRaw
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - Bucket:
+                        Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-raw-bucket'
+              - Sid: S3WriteProcessedQuarantine
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - Bucket:
+                        Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-processed-bucket'
+                  - !Sub
+                    - 'arn:aws:s3:::${Bucket}/*'
+                    - Bucket:
+                        Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-quarantine-bucket'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Role for partition manager Lambda
+  PartitionManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-partition-manager-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: PartitionManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectPrefix}-${Environment}-rds-credentials*'
+              - Sid: GlueCatalogUpdate
+                Effect: Allow
+                Action:
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchDeletePartition
+                  - glue:GetTable
+                  - glue:GetDatabase
+                Resource: '*'
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertsTopic
+
+  # ═══════════════════════════════════════════
+  # LAMBDA FUNCTIONS
+  # ═══════════════════════════════════════════
+
+  # Function 1: Event Processor — SQS → RDS
+  EventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectPrefix}-${Environment}-event-processor'
+      Description: >
+        Processes clickstream events from SQS queue.
+        Validates, enriches, and batch-writes events to RDS events table.
+      Runtime: !Ref LambdaRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt EventProcessorRole.Arn
+      Timeout: !Ref EventProcessorTimeout
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50   # Protect RDS connection pool
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-1'
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-2'
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-app-sg-id'
+      Environment:
+        Variables:
+          RDS_SECRET_NAME: !Sub '${ProjectPrefix}-${Environment}-rds-credentials'
+          RDS_HOST:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-rds-endpoint'
+          RDS_PORT:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-rds-port'
+          DB_NAME:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-db-name'
+          DLQ_URL: !Ref EventProcessorDLQ
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          ENVIRONMENT: !Ref Environment
+          LOG_LEVEL: !If [IsProd, 'WARNING', 'DEBUG']
+      Code:
+        ZipFile: |
+          # Placeholder — replaced by deploy.sh
+          def lambda_handler(event, context):
+              return {'statusCode': 200}
+      Layers:
+        - !Ref PsycopgLayer
+      Tags:
+        Project: !Ref ProjectPrefix
+        FunctionType: event-processor
+
+  # SQS trigger for event processor
+  EventProcessorSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventQueue.Arn
+      FunctionName: !GetAtt EventProcessorFunction.Arn
+      BatchSize: !Ref EventProcessorBatchSize
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures   # Partial batch failure support
+      ScalingConfig:
+        MaximumConcurrency: 50
+
+  # Function 2: Data Validator — S3 PutObject → validate
+  DataValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectPrefix}-${Environment}-data-validator'
+      Description: >
+        Validates incoming S3 data files (schema, format, completeness).
+        Routes valid files to processed zone, invalid to quarantine.
+      Runtime: !Ref LambdaRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt DataValidatorRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          PROCESSED_BUCKET:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-processed-bucket'
+          QUARANTINE_BUCKET:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-quarantine-bucket'
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Placeholder — replaced by deploy.sh
+          def lambda_handler(event, context):
+              return {'statusCode': 200}
+      Tags:
+        Project: !Ref ProjectPrefix
+        FunctionType: data-validator
+
+  # Allow S3 raw bucket to invoke data validator
+  DataValidatorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataValidatorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub
+        - 'arn:aws:s3:::${Bucket}'
+        - Bucket:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-raw-bucket'
+
+  # Function 3: Partition Manager — EventBridge scheduled
+  PartitionManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectPrefix}-${Environment}-partition-manager'
+      Description: >
+        Creates next month RDS table partitions and drops partitions
+        older than the retention period. Runs daily via EventBridge.
+      Runtime: !Ref LambdaRuntime
+      Handler: handler.lambda_handler
+      Role: !GetAtt PartitionManagerRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-1'
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-private-subnet-2'
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-app-sg-id'
+      Environment:
+        Variables:
+          RDS_SECRET_NAME: !Sub '${ProjectPrefix}-${Environment}-rds-credentials'
+          RDS_HOST:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-rds-endpoint'
+          DB_NAME:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-db-name'
+          GLUE_DATABASE:
+            Fn::ImportValue: !Sub '${ProjectPrefix}-${Environment}-glue-database'
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          PARTITION_RETENTION_MONTHS: '24'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Placeholder — replaced by deploy.sh
+          def lambda_handler(event, context):
+              return {'statusCode': 200}
+      Layers:
+        - !Ref PsycopgLayer
+      Tags:
+        Project: !Ref ProjectPrefix
+        FunctionType: partition-manager
+
+  # Lambda Layer: psycopg2 for PostgreSQL connections
+  PsycopgLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectPrefix}-${Environment}-psycopg2'
+      Description: psycopg2-binary for Python 3.11 Lambda
+      CompatibleRuntimes:
+        - python3.11
+        - python3.10
+      # In real deployment, this would be uploaded via deploy.sh
+      Content:
+        S3Bucket: !Sub '${ProjectPrefix}-${Environment}-glue-scripts'
+        S3Key: 'layers/psycopg2-layer.zip'
+
+  # ═══════════════════════════════════════════
+  # EVENTBRIDGE RULES
+  # ═══════════════════════════════════════════
+
+  # Daily partition manager trigger (midnight UTC)
+  PartitionManagerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-partition-manager-schedule'
+      Description: Triggers partition manager Lambda daily at midnight UTC
+      ScheduleExpression: 'cron(0 0 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: PartitionManagerTarget
+          Arn: !GetAtt PartitionManagerFunction.Arn
+          Input: |
+            {
+              "action": "create_and_cleanup",
+              "months_ahead": 2,
+              "retention_months": 24
+            }
+
+  PartitionManagerEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PartitionManagerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PartitionManagerSchedule.Arn
+
+  # Weekly materialized view refresh trigger (Sundays at 2am UTC)
+  MVRefreshSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-mv-refresh-schedule'
+      Description: Triggers Glue job to refresh RDS materialized views
+      ScheduleExpression: 'cron(0 2 ? * SUN *)'
+      State: ENABLED
+      Targets:
+        - Id: GlueMVRefreshTarget
+          Arn: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectPrefix}-${Environment}-rds-to-s3'
+          RoleArn: !GetAtt EventBridgeGlueRole.Arn
+
+  # EventBridge role to trigger Glue jobs
+  EventBridgeGlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-eventbridge-glue-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartGlueJobs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectPrefix}-${Environment}-*'
+
+  # ═══════════════════════════════════════════
+  # CLOUDWATCH ALARMS FOR LAMBDA
+  # ═══════════════════════════════════════════
+
+  EventProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-event-processor-errors'
+      AlarmDescription: Event processor Lambda error rate > 1%
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EventProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  SQSQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-sqs-queue-depth'
+      AlarmDescription: SQS event queue depth exceeds 10,000 messages
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  DLQMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-dlq-messages'
+      AlarmDescription: Messages arrived in DLQ — event processing failures
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventProcessorDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  EventQueueUrl:
+    Description: SQS event queue URL
+    Value: !Ref EventQueue
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-event-queue-url'
+
+  EventQueueArn:
+    Description: SQS event queue ARN
+    Value: !GetAtt EventQueue.Arn
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-event-queue-arn'
+
+  AlertsTopicArn:
+    Description: SNS alerts topic ARN
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-alerts-topic-arn'
+
+  EventProcessorFunctionArn:
+    Description: Event processor Lambda ARN
+    Value: !GetAtt EventProcessorFunction.Arn
+
+  DataValidatorFunctionArn:
+    Description: Data validator Lambda ARN
+    Value: !GetAtt DataValidatorFunction.Arn
+
+  PartitionManagerFunctionArn:
+    Description: Partition manager Lambda ARN
+    Value: !GetAtt PartitionManagerFunction.Arn

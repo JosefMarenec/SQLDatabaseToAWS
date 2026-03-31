@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Real-Time E-Commerce Analytics Platform - RDS Stack
+  Provisions VPC, subnets, security groups, RDS PostgreSQL 15, and Secrets Manager credentials.
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ecom-analytics
+    Description: Prefix applied to all resource names
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 65536
+    Description: Initial allocated storage in GB
+
+  DBMaxAllocatedStorage:
+    Type: Number
+    Default: 500
+    Description: Maximum auto-scaling storage limit in GB
+
+  DBName:
+    Type: String
+    Default: ecommerce
+
+  DBMasterUsername:
+    Type: String
+    Default: dbadmin
+    NoEcho: false
+
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: '10.0.1.0/24'
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: '10.0.2.0/24'
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: '10.0.10.0/24'
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: '10.0.11.0/24'
+
+# ─────────────────────────────────────────────
+# Conditions
+# ─────────────────────────────────────────────
+Conditions:
+  IsMultiAZ: !Equals [!Ref MultiAZ, 'true']
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── VPC ────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-vpc'
+        - Key: Project
+          Value: !Ref ProjectPrefix
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ── Public Subnets ─────────────────────────
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-public-1'
+        - Key: SubnetType
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-public-2'
+        - Key: SubnetType
+          Value: Public
+
+  # ── Private Subnets ────────────────────────
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-private-1'
+        - Key: SubnetType
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-private-2'
+        - Key: SubnetType
+          Value: Private
+
+  # ── NAT Gateways (private subnet egress) ───
+  EIPNat1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNat1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-nat-1'
+
+  # ── Route Tables ───────────────────────────
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── Security Groups ────────────────────────
+  # Bastion / application tier SG (for Lambda, Glue, application servers)
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for application tier (Lambda, Glue, app servers)
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-app-sg'
+
+  # RDS accepts connections only from the application SG
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL — allows access from app tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+          Description: PostgreSQL from application tier
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound (for OS patching)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-rds-sg'
+
+  # ── DB Subnet Group ────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Private subnets for ${ProjectPrefix} RDS'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-db-subnet-group'
+
+  # ── RDS Parameter Group (PostgreSQL 15 tuning) ─
+  RDSParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub '${ProjectPrefix} PostgreSQL 15 parameter group — performance tuned'
+      Family: postgres15
+      Parameters:
+        # Connection settings
+        max_connections: '500'
+        # Memory settings (adjust based on db.t3.medium: 4 GB RAM)
+        shared_buffers: '1GB'
+        effective_cache_size: '3GB'
+        work_mem: '16MB'
+        maintenance_work_mem: '256MB'
+        # Write-ahead log
+        wal_level: logical
+        max_wal_size: '2GB'
+        min_wal_size: '512MB'
+        checkpoint_completion_target: '0.9'
+        wal_buffers: '64MB'
+        # Query planner
+        default_statistics_target: '100'
+        random_page_cost: '1.1'         # SSD-optimized
+        effective_io_concurrency: '200'  # SSD-optimized
+        # Autovacuum tuning
+        autovacuum_vacuum_scale_factor: '0.02'
+        autovacuum_analyze_scale_factor: '0.01'
+        autovacuum_vacuum_cost_delay: '2ms'
+        # Logging
+        log_min_duration_statement: '1000'  # Log queries > 1s
+        log_checkpoints: '1'
+        log_connections: '0'
+        log_disconnections: '0'
+        log_lock_waits: '1'
+        deadlock_timeout: '1s'
+        # Performance
+        parallel_workers_per_gather: '4'
+        max_parallel_workers_per_gather: '4'
+        max_parallel_workers: '8'
+        # Extensions
+        shared_preload_libraries: 'pg_stat_statements,pg_cron'
+        pg_stat_statements.max: '10000'
+        pg_stat_statements.track: all
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-pg15-params'
+
+  # ── Secrets Manager ────────────────────────
+  RDSMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-credentials'
+      Description: !Sub 'Master credentials for ${ProjectPrefix} RDS PostgreSQL'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+        ExcludePunctuation: false
+        IncludeSpace: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectPrefix
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Attach the secret to the RDS instance for automatic rotation
+  RDSSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RDSMasterSecret
+      TargetId: !Ref RDSInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ── RDS Instance ───────────────────────────
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectPrefix}-${Environment}-postgres'
+      DBName: !Ref DBName
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: '15.4'
+      MasterUsername: !Sub '{{resolve:secretsmanager:${RDSMasterSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${RDSMasterSecret}:SecretString:password}}'
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MaxAllocatedStorage: !Ref DBMaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !If [IsMultiAZ, true, false]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBParameterGroupName: !Ref RDSParameterGroup
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      DeletionProtection: !If [IsProd, true, false]
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectPrefix}-${Environment}-postgres'
+        - Key: Project
+          Value: !Ref ProjectPrefix
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role for Enhanced Monitoring ──────
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectPrefix}-${Environment}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # ── CloudWatch Alarms ──────────────────────
+  RDSCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-rds-high-cpu'
+      AlarmDescription: RDS CPU utilization exceeds 80% for 5 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RDSFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-rds-low-storage'
+      AlarmDescription: RDS free storage drops below 10 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10737418240   # 10 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+
+  RDSConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectPrefix}-${Environment}-rds-high-connections'
+      AlarmDescription: RDS connection count exceeds 400 (of 500 max)
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 400
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-vpc-id'
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-public-subnet-1'
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-public-subnet-2'
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-private-subnet-1'
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-private-subnet-2'
+
+  ApplicationSecurityGroupId:
+    Description: Application tier security group ID
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-app-sg-id'
+
+  RDSSecurityGroupId:
+    Description: RDS security group ID
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-sg-id'
+
+  RDSEndpoint:
+    Description: RDS instance endpoint hostname
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-endpoint'
+
+  RDSPort:
+    Description: RDS instance port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-port'
+
+  RDSSecretArn:
+    Description: ARN of Secrets Manager secret containing RDS credentials
+    Value: !Ref RDSMasterSecret
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-rds-secret-arn'
+
+  DBName:
+    Description: PostgreSQL database name
+    Value: !Ref DBName
+    Export:
+      Name: !Sub '${ProjectPrefix}-${Environment}-db-name'
